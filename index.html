@@ -404,6 +404,9 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* хранилище недоступно */ } }
 };
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const UA = navigator.userAgent || '';
+const IS_ANDROID = /Android/i.test(UA);
+const IS_MOBILE = IS_ANDROID || /iPhone|iPad|iPod|Mobile/i.test(UA) || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(UA));
 const TONES = { green: [52, 211, 153], blue: [56, 189, 248], amber: [251, 191, 36], red: [251, 113, 133], idle: [148, 163, 184] };
 const TONE_NAMES = ['green', 'blue', 'amber', 'red', 'idle'];
 const setTone = (el, tone) => { TONE_NAMES.forEach(t => el.classList.remove('tone-' + t)); el.classList.add('tone-' + tone); };
@@ -436,12 +439,13 @@ const freshSession = () => ({
   interim: '', interimWords: 0, interimTimes: [], interimProcessed: 0,
   chunks: [], overNotified: false,
   rec: null, recFatal: false, quickEnds: 0, netErr: 0, recStartedAt: 0,
+  gotResult: false, soundOn: false, loudSince: 0, conflictHandled: false, liveStartedAt: 0, noResultWarned: false,
   demo: null, demoSpeaking: false,
   ptr: 0, painted: 0, curEl: null,
   wpmNow: 0, wpmShown: 0, gauge: 0, paceTone: 'idle', level: 0, rms: 0
 });
 const S = Object.assign({
-  mode: 'live', target: 180, pauseThr: 3500, dict: [], script: { cores: [], spans: [] }, chart: null
+  mode: 'live', target: 180, pauseThr: 3500, noAnalyser: false, dict: [], script: { cores: [], spans: [] }, chart: null
 }, freshSession());
 
 try {
@@ -528,7 +532,7 @@ async function initAudio() {
   if (audio.analyser) return 'ok';
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'none';
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const Ctx = window.AudioContext || window.webkitAudioContext;
     const ctx = new Ctx();
     if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) { /* продолжаем */ } }
@@ -546,6 +550,14 @@ async function initAudio() {
     if (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') return 'nomic';
     return 'none';
   }
+}
+let audioAttaching = false;
+async function attachAudioQuietly() {
+  if (IS_MOBILE || S.noAnalyser || audio.analyser || audioAttaching) return;
+  audioAttaching = true;
+  try { await initAudio(); } catch (e) { /* волна необязательна */ }
+  audioAttaching = false;
+  if (!S.rec) stopAudio();
 }
 function stopAudio() {
   try { if (audio.stream) audio.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* уже остановлен */ }
@@ -634,21 +646,34 @@ function createRecognizer() {
   r.continuous = true;
   r.interimResults = true;
   r.maxAlternatives = 1;
-  let lastFinal = -1;
+  let lastFinal = -1, lastFinalText = '';
 
-  r.onstart = () => { lastFinal = -1; S.recStartedAt = performance.now(); };
+  const stripDone = txt => {
+    if (!IS_ANDROID || !lastFinalText) return txt;
+    return txt.toLowerCase().startsWith(lastFinalText.toLowerCase()) ? txt.slice(lastFinalText.length).trim() : txt;
+  };
+
+  r.onstart = () => { lastFinal = -1; lastFinalText = ''; S.recStartedAt = performance.now(); };
+  r.onaudiostart = () => { attachAudioQuietly(); };
+  r.onspeechstart = () => { S.soundOn = true; };
+  r.onspeechend = () => { S.soundOn = false; };
 
   r.onresult = e => {
     if (S.status !== 'running') return;
     S.netErr = 0;
+    S.gotResult = true;
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const res = e.results[i];
-      const txt = (res[0] && res[0].transcript || '').trim();
-      if (!txt) continue;
+      const raw = (res[0] && res[0].transcript || '').trim();
+      if (!raw) continue;
+      const txt = stripDone(raw);
       if (res.isFinal) {
-        if (i > lastFinal) { lastFinal = i; commitFinal(txt.split(/\s+/)); }
-      } else { interim += ' ' + txt; }
+        if (i > lastFinal) {
+          lastFinal = i; lastFinalText = raw;
+          if (txt) commitFinal(txt.split(/\s+/));
+        }
+      } else if (txt) { interim += ' ' + txt; }
     }
     setInterim(interim);
   };
@@ -669,6 +694,7 @@ function createRecognizer() {
   };
 
   r.onend = () => {
+    S.soundOn = false;
     if (S.interim && S.status === 'running' && S.rec === r) {
       commitFinal(S.interim.split(/\s+/));
     }
@@ -707,13 +733,45 @@ function fatalLive(kind) {
 async function startLive() {
   if (!SR) { showNotice('unsupported'); return false; }
   S.recFatal = false; S.quickEnds = 0; S.netErr = 0;
-  const a = await initAudio();
-  if (a === 'denied') { showNotice('denied'); return false; }
-  if (a === 'nomic') { showNotice('nomic'); return false; }
-  S.rec = createRecognizer();
-  try { S.rec.start(); } catch (e) { /* уже запущено */ }
+  S.gotResult = false; S.soundOn = false; S.loudSince = 0; S.conflictHandled = false;
+  S.noResultWarned = false; S.liveStartedAt = performance.now();
+  teardownLive();
+  const r = createRecognizer();
+  S.rec = r;
+  try { r.start(); } catch (e) {
+    S.rec = null;
+    toast('Не удалось запустить распознавание: ' + (e && e.message ? e.message : e), 'red');
+    showNotice('unsupported');
+    return false;
+  }
   return true;
 }
+
+function restartRecognizer() {
+  teardownLive();
+  const r = createRecognizer();
+  S.rec = r;
+  setTimeout(() => {
+    if (S.rec === r && S.status === 'running' && !S.recFatal) { try { r.start(); } catch (err) { /* уже запущено */ } }
+  }, 350);
+}
+
+setInterval(() => {
+  if (S.status !== 'running' || S.mode !== 'live' || !S.rec) return;
+  const now = performance.now();
+  if (audio.analyser && S.rms > 0.04) { if (!S.loudSince) S.loudSince = now; } else S.loudSince = 0;
+  if (audio.analyser && !S.gotResult && S.loudSince && now - S.loudSince > 5000 && !S.conflictHandled) {
+    S.conflictHandled = true; S.noAnalyser = true;
+    stopAudio();
+    restartRecognizer();
+    toast('Звук есть, а текста нет: отдаю микрофон распознаванию. Волна станет упрощённой.', 'amber');
+    return;
+  }
+  if (!S.gotResult && now - S.liveStartedAt > 15000 && !S.noResultWarned) {
+    S.noResultWarned = true;
+    toast('Речь пока не распознана. Говорите ближе к микрофону, нужен интернет и браузер Chrome.', 'amber');
+  }
+}, 1000);
 
 /* ============ Демо-симуляция ============ */
 function buildDemo() {
@@ -886,7 +944,7 @@ function purityPct() {
 
 function silenceTick(el) {
   if (!S.hasSpoken) return;
-  if (S.mode === 'live' && audio.analyser && S.rms > 0.05) markActivity(true);
+  if (S.mode === 'live' && (S.soundOn || (audio.analyser && S.rms > 0.05))) markActivity(true);
   const sil = el - S.lastActivity;
   if (sil > S.pauseThr && !S.pauseFlag) {
     S.pauseFlag = true;
@@ -1015,7 +1073,7 @@ function updateBars(now, el) {
     simulate(now, amp);
     S.rms = S.demoSpeaking ? 0.12 : 0;
   } else if (S.status === 'running' && S.mode === 'live') {
-    const talking = S.hasSpoken && (el - S.lastActivity) < 900;
+    const talking = S.soundOn || (S.hasSpoken && (el - S.lastActivity) < 900);
     simulate(now, talking ? 0.55 + 0.35 * Math.abs(Math.sin(now * 0.0105)) : 0.02);
     S.rms = talking ? 0.1 : 0;
   } else {
