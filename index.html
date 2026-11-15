@@ -360,17 +360,22 @@ const DEMO = [
 ];
 const DEMO_SCRIPT = 'Здравствуйте, уважаемое жюри! Меня зовут Алексей, и я представляю проект «Умная метеостанция». Идея появилась, когда нам не хватило данных о погоде во дворе. Станция измеряет температуру, влажность, давление и отправляет всё на сайт школы. Мы собрали её на Arduino с тремя датчиками и солнечной панелью. Две недели тестов показали, что датчик на солнце завышает температуру. Мы добавили защитный экран. Ошибка исправлена, и точность выросла вдвое. Дальше подключим датчик качества воздуха. Спасибо за внимание!';
 
+const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+// На телефонах и после обнаруженного конфликта волна не открывает второй поток микрофона: он глушит распознавание
+const analyserBlocked = () => IS_MOBILE || store.get('speechRadar.noAnalyser') === '1';
+
 /* ============ Состояние ============ */
 const freshSession = () => ({
   status: 'idle', starting: false, acc: 0, segStart: 0,
   wordEvents: [], firstT: null, lastT: 0,
   counts: new Map(), parasites: 0, lastPara: '',
   pauses: 0, inPause: false, hasSpoken: false, lastSpeechTime: 0, lastWordTime: 0, silenceCarry: 0,
-  loudTicks: 0, sigMax: 0, deadMs: 0, audioFallback: false,
+  loudTicks: 0, sigMax: 0, deadMs: 0, audioFallback: analyserBlocked(),
   markers: [], curPause: null,
   interim: '', interimWords: 0, interimTimes: [], interimProcessed: 0, chunks: [],
   overNotified: false,
   rec: null, recFatal: false, quickEnds: 0, netErr: 0, recStartedAt: 0,
+  recBeganAt: 0, recAudio: false, lastRecAct: 0, noRecMs: 0, recRestarts: 0, silentWarned: false, lastFinalKey: '', lastFinalAt: 0,
   demo: null, demoSpeaking: false, demoMono: false,
   ptr: 0, painted: 0, curEl: null,
   wpmNow: 0, wpmShown: 0, paceTone: 'idle',
@@ -443,11 +448,13 @@ function toast(msg, tone) {
 /* ============ Уведомления ============ */
 const NOTICES = {
   unsupported: ['Нет распознавания речи.', 'Откройте в Chrome или Edge.'],
-  denied: ['Микрофон заблокирован.', 'Разрешите доступ для сайта.'],
+  denied: ['Микрофон заблокирован.', 'Разрешите доступ для сайта или откройте страницу через https / localhost.'],
   nomic: ['Микрофон не найден.', 'Подключите микрофон.'],
   network: ['Нет связи с сервисом распознавания.', 'Проверьте интернет.'],
   unstable: ['Запись постоянно прерывается.', 'Перезагрузите страницу.'],
-  lang: ['Русский язык недоступен.', 'Откройте в Chrome.']
+  lang: ['Язык распознавания недоступен.', 'Откройте в Chrome.'],
+  silent: ['Распознавание не получает звук.', 'Проверьте микрофон в настройках браузера или запустите демо.'],
+  insecure: ['Нужен защищённый адрес.', 'Распознавание речи работает только через https или localhost.']
 };
 function showNotice(kind) {
   const n = NOTICES[kind] || NOTICES.unstable;
@@ -548,6 +555,7 @@ const audioActive = () => !!aud.analyser && !S.audioFallback;
 function degradeAudio() {
   if (S.audioFallback || S.mode !== 'live') return false;
   S.audioFallback = true;
+  store.set('speechRadar.noAnalyser', '1');
   stopAudio();
   toast('Микрофон занят распознаванием: волна упрощена', 'amber');
   return true;
@@ -628,8 +636,18 @@ function tick250() {
     // Датчик "мертвого" микрофона (Android отдаёт тишину, пока идёт распознавание)
     if (now - S.lastWordTime < 1500 && S.hasSpoken && S.sig < 0.002) S.deadMs += 250; else S.deadMs = 0;
     if (S.deadMs >= 5000) degradeAudio();
+    // Звук есть, а распознаватель молчит: микрофон занят волной, отдаём его распознаванию
+    if (now - S.lastRecAct <= 2500) S.noRecMs = 0;
+    else if (loud) S.noRecMs += 250;
+    if (S.noRecMs >= 4000) { S.noRecMs = 0; if (degradeAudio()) restartRecognizer(); }
   } else if (S.mode === 'demo' && S.demoSpeaking) {
     touchSpeech('sound');
+  }
+
+  // Распознаватель так и не получил звук
+  if (S.mode === 'live' && S.rec && !S.recAudio && performance.now() - S.recBeganAt > 6000) {
+    if (S.recRestarts < 2) { S.recRestarts++; restartRecognizer(); }
+    else if (!S.silentWarned) { S.silentWarned = true; showNotice('silent'); }
   }
 
   // Пауза
@@ -737,24 +755,34 @@ function scrollTranscript() { transcript.scrollTop = transcript.scrollHeight; }
 /* ============ Живое распознавание речи ============ */
 function createRecognizer() {
   const r = new SR();
-  r.lang = 'ru-RU';
+  r.lang = S.lang || 'ru-RU';
   r.continuous = true;
   r.interimResults = true;
   r.maxAlternatives = 1;
   let lastFinal = -1;
 
   r.onstart = () => { lastFinal = -1; S.recStartedAt = performance.now(); };
+  r.onaudiostart = () => { S.recAudio = true; S.lastRecAct = Date.now(); };
+  r.onspeechstart = () => { S.lastRecAct = Date.now(); };
 
   r.onresult = e => {
+    S.lastRecAct = Date.now();
     if (S.status !== 'running') return;
     S.netErr = 0;
+    if (e.results.length <= lastFinal) lastFinal = -1;
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const res = e.results[i];
       const txt = (res[0] && res[0].transcript || '').trim();
       if (!txt) continue;
       if (res.isFinal) {
-        if (i > lastFinal) { lastFinal = i; commitFinal(txt.split(/\s+/)); }
+        if (i > lastFinal) {
+          lastFinal = i;
+          const key = txt.toLowerCase().replace(/\s+/g, ' ');
+          if (key === S.lastFinalKey && Date.now() - S.lastFinalAt < 3000) continue;
+          S.lastFinalKey = key; S.lastFinalAt = Date.now();
+          commitFinal(txt.split(/\s+/));
+        }
       } else { interim += ' ' + txt; }
     }
     setInterim(interim);
@@ -795,7 +823,7 @@ function teardownLive() {
   const r = S.rec;
   S.rec = null;
   if (r) {
-    r.onstart = r.onresult = r.onerror = r.onend = null;
+    r.onstart = r.onaudiostart = r.onspeechstart = r.onresult = r.onerror = r.onend = null;
     try { r.abort(); } catch (e) { /* уже остановлено */ }
   }
 }
@@ -810,17 +838,42 @@ function fatalLive(kind) {
   showNotice(kind);
 }
 
-async function startLive() {
+function startRecognizer() {
   if (!SR) { showNotice('unsupported'); return false; }
   S.recFatal = false; S.quickEnds = 0; S.netErr = 0;
-  if (!S.audioFallback) {
-    const a = await initAudio();
-    if (a === 'denied') { showNotice('denied'); return false; }
-    if (a === 'nomic') { showNotice('nomic'); return false; }
-  }
+  S.recAudio = false; S.lastRecAct = 0; S.noRecMs = 0; S.recRestarts = 0; S.silentWarned = false;
+  S.recBeganAt = performance.now();
   S.rec = createRecognizer();
   try { S.rec.start(); } catch (e) { /* уже запущено */ }
   return true;
+}
+
+function restartRecognizer() {
+  if (S.mode !== 'live' || S.status !== 'running') return;
+  if (S.interim) commitFinal(S.interim.split(/\s+/));
+  teardownLive();
+  setTimeout(() => {
+    if (S.mode !== 'live' || S.status !== 'running' || S.rec) return;
+    S.recFatal = false; S.recAudio = false; S.recBeganAt = performance.now();
+    S.rec = createRecognizer();
+    try { S.rec.start(); } catch (e) {
+      setTimeout(() => { try { if (S.rec) S.rec.start(); } catch (e2) { /* не вышло */ } }, 300);
+    }
+  }, 300);
+}
+
+// Волна подключается позже и только после старта распознавания, чтобы не отбирать у него микрофон
+let audioPending = false;
+function attachAnalyser() {
+  if (S.audioFallback || aud.analyser || audioPending) return;
+  audioPending = true;
+  setTimeout(async () => {
+    if (S.mode !== 'live' || S.status !== 'running' || S.audioFallback) { audioPending = false; return; }
+    const a = await initAudio();
+    audioPending = false;
+    if (a !== 'ok') { S.audioFallback = true; return; }
+    if (S.status === 'idle' || S.status === 'finished' || S.mode !== 'live') stopAudio();
+  }, 700);
 }
 
 /* ============ Демо-симуляция ============ */
@@ -868,11 +921,7 @@ async function startSession() {
   sfxCtx();
   if (S.mode === 'demo' && !scriptArea.value.trim()) { scriptArea.value = DEMO_SCRIPT; updateScriptStats(); }
   buildScript();
-  if (S.mode === 'live') {
-    const ok = await startLive();
-    if (!ok) { S.starting = false; updateButtons(); return; }
-  }
-  if (S.status !== 'idle') { S.starting = false; return; }
+  if (S.mode === 'live' && !startRecognizer()) { S.starting = false; updateButtons(); return; }
   S.starting = false;
   S.acc = 0; S.segStart = performance.now(); S.status = 'running';
   S.lastSpeechTime = Date.now();
@@ -880,6 +929,7 @@ async function startSession() {
   startTicker();
   play.start();
   updateButtons();
+  if (S.mode === 'live') attachAnalyser();
 }
 
 function pauseSession() {
@@ -893,22 +943,18 @@ function pauseSession() {
   updateButtons();
 }
 
-async function resumeSession() {
+function resumeSession() {
   if (S.status !== 'paused' || S.starting) return;
   hideNotice();
   sfxCtx();
-  if (S.mode === 'live') {
-    S.starting = true;
-    const ok = await startLive();
-    S.starting = false;
-    if (!ok) return;
-  }
+  if (S.mode === 'live' && !startRecognizer()) return;
   S.segStart = performance.now();
   S.status = 'running';
   S.lastSpeechTime = Date.now() - S.silenceCarry;
   S.loudTicks = 0; S.deadMs = 0;
   startTicker();
   updateButtons();
+  if (S.mode === 'live') attachAnalyser();
 }
 
 function finishSession() {
@@ -933,7 +979,7 @@ function resetAll() {
   stopTicker();
   teardownLive();
   stopAudio();
-  const keepFallback = false;
+  const keepFallback = analyserBlocked();
   Object.assign(S, freshSession());
   S.audioFallback = keepFallback;
   finalText.innerHTML = ''; interimText.innerHTML = '';
@@ -1059,7 +1105,7 @@ function updateMetrics(el) {
   if (!hasContent) {
     placeholder.textContent = S.status === 'idle'
       ? (S.mode === 'demo' ? 'Нажмите Старт: демо начнётся само' : 'Нажмите Старт и говорите')
-      : 'Слушаю';
+      : (S.mode === 'live' && S.talking && !S.lastRecAct ? 'Звук слышен, жду распознавание' : 'Слушаю');
   }
 }
 
@@ -1589,6 +1635,7 @@ function init() {
   updateButtons();
   icons();
   if (!SR) showNotice('unsupported');
+  else if (!window.isSecureContext && location.protocol !== 'file:') showNotice('insecure');
   requestAnimationFrame(frame);
 }
 init();
